@@ -122,7 +122,7 @@
   (milestones (list 10 {description: (string-ascii 200), amount: uint})))
   (let 
     ((proposal-id (+ (var-get proposal-counter) u1))
-     (voting-start (+ block-height u144)) ;; 1 day delay
+     (voting-start (+ stacks-block-height u144)) ;; 1 day delay
      (voting-end (+ voting-start VOTING_PERIOD)))
     (asserts! (> (len milestones) u0) ERR_INVALID_PROPOSAL)
     (asserts! (<= (len milestones) MAX_MILESTONES) ERR_INVALID_PROPOSAL)
@@ -159,14 +159,14 @@
      (voter-balance (get-balance tx-sender))
      (voting-power (calculate-voting-power tx-sender proposal-id voter-balance)))
     
-    (asserts! (> block-height (get voting-start proposal)) ERR_VOTING_ENDED)
-    (asserts! (< block-height (get voting-end proposal)) ERR_VOTING_ENDED)
+    (asserts! (> stacks-block-height (get voting-start proposal)) ERR_VOTING_ENDED)
+    (asserts! (< stacks-block-height (get voting-end proposal)) ERR_VOTING_ENDED)
     (asserts! (is-none (map-get? proposal-votes {proposal-id: proposal-id, voter: tx-sender})) ERR_ALREADY_VOTED)
     (asserts! (> voter-balance u0) ERR_UNAUTHORIZED)
     
     (map-set proposal-votes 
       {proposal-id: proposal-id, voter: tx-sender}
-      {vote: vote-yes, weight: voting-power, block-height: block-height})
+      {vote: vote-yes, weight: voting-power, block-height: stacks-block-height})
     
     (map-set user-voting-power 
       {user: tx-sender, proposal-id: proposal-id} 
@@ -186,7 +186,7 @@
   (let 
     ((proposal (unwrap! (map-get? proposals proposal-id) ERR_INVALID_PROPOSAL)))
     
-    (asserts! (>= block-height (get voting-end proposal)) ERR_VOTING_ACTIVE)
+    (asserts! (>= stacks-block-height (get voting-end proposal)) ERR_VOTING_ACTIVE)
     (asserts! (is-eq (get status proposal) "pending") ERR_INVALID_PROPOSAL)
     
     (let 
@@ -224,7 +224,7 @@
     
     (map-set milestone-verifications
       {proposal-id: proposal-id, milestone-id: milestone-id}
-      {verified: true, oracle: tx-sender, verification-block: block-height})
+      {verified: true, oracle: tx-sender, verification-block: stacks-block-height})
     
     (ok true)))
 
@@ -267,7 +267,7 @@
     
     (map-set slashing-claims
       {proposal-id: proposal-id, claimant: tx-sender}
-      {amount: claim-amount, block-height: block-height, processed: false})
+      {amount: claim-amount, block-height: stacks-block-height, processed: false})
     
     (ok true)))
 
@@ -277,7 +277,7 @@
     ((claim (unwrap! (map-get? slashing-claims {proposal-id: proposal-id, claimant: claimant}) ERR_INVALID_PROPOSAL))
      (proposal (unwrap! (map-get? proposals proposal-id) ERR_INVALID_PROPOSAL)))
     
-    (asserts! (>= block-height (+ (get block-height claim) SLASHING_PERIOD)) ERR_SLASHING_PERIOD_ACTIVE)
+    (asserts! (>= stacks-block-height (+ (get block-height claim) SLASHING_PERIOD)) ERR_SLASHING_PERIOD_ACTIVE)
     (asserts! (not (get processed claim)) ERR_FUNDS_ALREADY_RELEASED)
     
     (let ((escrow-balance (default-to u0 (map-get? proposal-escrow proposal-id))))
@@ -341,3 +341,13 @@
 
 (define-read-only (get-slashing-claim (proposal-id uint) (claimant principal))
   (map-get? slashing-claims {proposal-id: proposal-id, claimant: claimant}))
+
+;; private functions
+
+(define-private (calculate-voting-power (voter principal) (proposal-id uint) (balance uint))
+  (if (is-eq (var-get voting-type) "quadratic")
+    (* balance balance) ;; Quadratic-style weighting (simplified): square of balance
+    balance)) ;; Token-weighted: direct balance
+
+(define-private (get-milestone-amount (milestone {description: (string-ascii 200), amount: uint}))
+  (get amount milestone))
