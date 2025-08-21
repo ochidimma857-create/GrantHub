@@ -306,3 +306,38 @@
     (asserts! (or (is-eq new-type "quadratic") (is-eq new-type "weighted")) ERR_INVALID_PROPOSAL)
     (var-set voting-type new-type)
     (ok true)))
+
+;; read only functions
+
+(define-read-only (get-proposal (proposal-id uint))
+  (map-get? proposals proposal-id))
+
+(define-read-only (get-balance (user principal))
+  (default-to u0 (map-get? user-balances user)))
+
+(define-read-only (get-vote (proposal-id uint) (voter principal))
+  (map-get? proposal-votes {proposal-id: proposal-id, voter: voter}))
+
+(define-read-only (get-treasury-balance)
+  (var-get dao-treasury))
+
+(define-read-only (get-total-supply)
+  (var-get total-supply))
+
+(define-read-only (get-proposal-count)
+  (var-get proposal-counter))
+
+(define-read-only (get-milestone-verification (proposal-id uint) (milestone-id uint))
+  (map-get? milestone-verifications {proposal-id: proposal-id, milestone-id: milestone-id}))
+
+(define-read-only (get-escrow-balance (proposal-id uint))
+  (default-to u0 (map-get? proposal-escrow proposal-id)))
+
+(define-read-only (is-oracle-authorized (oracle principal))
+  (default-to false (map-get? authorized-oracles oracle)))
+
+(define-read-only (get-voting-type)
+  (var-get voting-type))
+
+(define-read-only (get-slashing-claim (proposal-id uint) (claimant principal))
+  (map-get? slashing-claims {proposal-id: proposal-id, claimant: claimant}))
