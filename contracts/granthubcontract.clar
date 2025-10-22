@@ -151,6 +151,28 @@
   {proposal-id: uint, user: principal}
   {amount: uint, block-height: uint, processed: bool})
 
+;; NEW: Delegation system
+(define-map voting-delegations
+  {delegator: principal, proposal-id: uint}
+  {delegate: principal, block-height: uint})
+
+;; NEW: Proposal amendments
+(define-map proposal-amendments
+  {proposal-id: uint, amendment-id: uint}
+  {title: (string-ascii 100), description: (string-ascii 500), proposer: principal, block-height: uint, approved: bool})
+
+(define-map proposal-amendment-counter uint uint)
+
+;; NEW: Milestone progress tracking
+(define-map milestone-progress
+  {proposal-id: uint, milestone-id: uint}
+  {completion-percentage: uint, last-updated: uint, notes: (string-ascii 200)})
+
+;; NEW: Oracle consensus tracking
+(define-map milestone-oracle-consensus
+  {proposal-id: uint, milestone-id: uint}
+  {votes-for: uint, votes-against: uint, total-votes: uint})
+
 
 ;; public functions
 
@@ -361,10 +383,12 @@
     (var-set oracle-count (unwrap-panic (safe-sub (var-get oracle-count) u1)))
     (ok true)))
 
-;; Verify milestone (oracle only)
-(define-public (verify-milestone (proposal-id uint) (milestone-id uint))
+;; Verify milestone (oracle only) - OPTIMIZED with consensus tracking
+(define-public (verify-milestone (proposal-id uint) (milestone-id uint) (approve bool))
   (let 
-    ((proposal (unwrap! (map-get? proposals proposal-id) ERR_INVALID_PROPOSAL)))
+    ((proposal (unwrap! (map-get? proposals proposal-id) ERR_INVALID_PROPOSAL))
+     (consensus (default-to {votes-for: u0, votes-against: u0, total-votes: u0} 
+                            (map-get? milestone-oracle-consensus {proposal-id: proposal-id, milestone-id: milestone-id}))))
     
     (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
     (asserts! (default-to false (map-get? authorized-oracles tx-sender)) ERR_ORACLE_NOT_AUTHORIZED)
@@ -373,9 +397,18 @@
     (asserts! (is-eq milestone-id (get current-milestone proposal)) ERR_INVALID_MILESTONE)
     (asserts! (is-none (map-get? oracle-votes {proposal-id: proposal-id, milestone-id: milestone-id, oracle: tx-sender})) ERR_ORACLE_ALREADY_VOTED)
     
+    ;; Record oracle vote
     (map-set oracle-votes
       {proposal-id: proposal-id, milestone-id: milestone-id, oracle: tx-sender}
-      {verified: true, block-height: stacks-block-height})
+      {verified: approve, block-height: stacks-block-height})
+    
+    ;; Update consensus tracking
+    (let ((new-votes-for (if approve (unwrap-panic (safe-add (get votes-for consensus) u1)) (get votes-for consensus)))
+          (new-votes-against (if approve (get votes-against consensus) (unwrap-panic (safe-add (get votes-against consensus) u1))))
+          (new-total-votes (unwrap-panic (safe-add (get total-votes consensus) u1))))
+      (map-set milestone-oracle-consensus
+        {proposal-id: proposal-id, milestone-id: milestone-id}
+        {votes-for: new-votes-for, votes-against: new-votes-against, total-votes: new-total-votes}))
     
     (ok true)))
 
@@ -470,6 +503,93 @@
     (var-set voting-type new-type)
     (ok true)))
 
+;; NEW: Delegate voting power
+(define-public (delegate-voting-power (proposal-id uint) (delegate principal))
+  (begin
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (not (is-eq tx-sender delegate)) ERR_INVALID_INPUT)
+    (asserts! (> (default-to u0 (map-get? user-balances tx-sender)) u0) ERR_UNAUTHORIZED)
+    (asserts! (is-some (map-get? proposals proposal-id)) ERR_INVALID_PROPOSAL)
+    (map-set voting-delegations
+      {delegator: tx-sender, proposal-id: proposal-id}
+      {delegate: delegate, block-height: stacks-block-height})
+    (ok true)))
+
+;; NEW: Revoke delegation
+(define-public (revoke-delegation (proposal-id uint))
+  (begin
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (is-some (map-get? voting-delegations {delegator: tx-sender, proposal-id: proposal-id})) ERR_INVALID_INPUT)
+    (map-delete voting-delegations {delegator: tx-sender, proposal-id: proposal-id})
+    (ok true)))
+
+;; NEW: Batch vote on multiple proposals
+(define-public (batch-vote (votes (list 10 {proposal-id: uint, vote-yes: bool})))
+  (begin
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (> (len votes) u0) ERR_INVALID_INPUT)
+    (ok (map batch-vote-helper votes))))
+
+(define-private (batch-vote-helper (vote-data {proposal-id: uint, vote-yes: bool}))
+  (match (vote-on-proposal (get proposal-id vote-data) (get vote-yes vote-data))
+    success true
+    error false))
+
+;; NEW: Submit proposal amendment
+(define-public (submit-amendment 
+  (proposal-id uint)
+  (title (string-ascii 100))
+  (description (string-ascii 500)))
+  (let ((proposal (unwrap! (map-get? proposals proposal-id) ERR_INVALID_PROPOSAL))
+        (amendment-counter (default-to u0 (map-get? proposal-amendment-counter proposal-id)))
+        (new-amendment-id (safe-add amendment-counter u1)))
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (is-some new-amendment-id) ERR_INVALID_AMOUNT)
+    (asserts! (is-eq (get status proposal) "approved") ERR_PROPOSAL_NOT_APPROVED)
+    (asserts! (> (len title) u0) ERR_INVALID_INPUT)
+    (asserts! (> (len description) u0) ERR_INVALID_INPUT)
+    (map-set proposal-amendments
+      {proposal-id: proposal-id, amendment-id: (unwrap-panic new-amendment-id)}
+      {title: title, description: description, proposer: tx-sender, block-height: stacks-block-height, approved: false})
+    (map-set proposal-amendment-counter proposal-id (unwrap-panic new-amendment-id))
+    (ok (unwrap-panic new-amendment-id))))
+
+;; NEW: Approve amendment (owner only)
+(define-public (approve-amendment (proposal-id uint) (amendment-id uint))
+  (let ((amendment (unwrap! (map-get? proposal-amendments {proposal-id: proposal-id, amendment-id: amendment-id}) ERR_INVALID_PROPOSAL)))
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (not (get approved amendment)) ERR_INVALID_INPUT)
+    (map-set proposal-amendments
+      {proposal-id: proposal-id, amendment-id: amendment-id}
+      (merge amendment {approved: true}))
+    (ok true)))
+
+;; NEW: Update milestone progress
+(define-public (update-milestone-progress 
+  (proposal-id uint)
+  (milestone-id uint)
+  (completion-percentage uint)
+  (notes (string-ascii 200)))
+  (let ((proposal (unwrap! (map-get? proposals proposal-id) ERR_INVALID_PROPOSAL)))
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (is-eq tx-sender (get proposer proposal)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status proposal) "approved") ERR_PROPOSAL_NOT_APPROVED)
+    (asserts! (< milestone-id (len (get milestones proposal))) ERR_INVALID_MILESTONE)
+    (asserts! (<= completion-percentage u100) ERR_INVALID_INPUT)
+    (map-set milestone-progress
+      {proposal-id: proposal-id, milestone-id: milestone-id}
+      {completion-percentage: completion-percentage, last-updated: stacks-block-height, notes: notes})
+    (ok true)))
+
+;; NEW: Get effective voting power (including delegations)
+(define-private (get-effective-voting-power (voter principal) (proposal-id uint))
+  (let ((direct-balance (default-to u0 (map-get? user-balances voter)))
+        (delegation (map-get? voting-delegations {delegator: voter, proposal-id: proposal-id})))
+    (if (is-some delegation)
+      u0  ;; If delegated, voter has no direct power
+      (calculate-voting-power voter proposal-id direct-balance))))
+
 ;; read only functions
 
 (define-read-only (get-proposal (proposal-id uint))
@@ -520,6 +640,22 @@
 (define-read-only (get-emergency-withdrawal (proposal-id uint) (user principal))
   (map-get? emergency-withdrawals {proposal-id: proposal-id, user: user}))
 
+;; NEW: Read-only functions for new features
+(define-read-only (get-delegation (delegator principal) (proposal-id uint))
+  (map-get? voting-delegations {delegator: delegator, proposal-id: proposal-id}))
+
+(define-read-only (get-amendment (proposal-id uint) (amendment-id uint))
+  (map-get? proposal-amendments {proposal-id: proposal-id, amendment-id: amendment-id}))
+
+(define-read-only (get-amendment-count (proposal-id uint))
+  (default-to u0 (map-get? proposal-amendment-counter proposal-id)))
+
+(define-read-only (get-milestone-progress (proposal-id uint) (milestone-id uint))
+  (map-get? milestone-progress {proposal-id: proposal-id, milestone-id: milestone-id}))
+
+(define-read-only (get-milestone-consensus (proposal-id uint) (milestone-id uint))
+  (map-get? milestone-oracle-consensus {proposal-id: proposal-id, milestone-id: milestone-id}))
+
 ;; private functions
 
 
@@ -527,9 +663,14 @@
 
 
 
-;; Check if milestone has oracle consensus
+;; OPTIMIZED: Check if milestone has oracle consensus
 (define-private (has-oracle-consensus (proposal-id uint) (milestone-id uint))
-  true) ;; Simplified for now - in production, implement proper oracle consensus checking
+  (let ((consensus (default-to {votes-for: u0, votes-against: u0, total-votes: u0}
+                               (map-get? milestone-oracle-consensus {proposal-id: proposal-id, milestone-id: milestone-id}))))
+    (and 
+      (>= (get total-votes consensus) ORACLE_CONSENSUS_THRESHOLD)
+      (>= (get votes-for consensus) ORACLE_CONSENSUS_THRESHOLD)
+      (> (get votes-for consensus) (get votes-against consensus)))))
 
 ;; Emergency withdrawal function (emergency mode only)
 (define-public (emergency-withdraw (proposal-id uint) (amount uint))
