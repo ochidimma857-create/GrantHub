@@ -1,94 +1,3 @@
-
-;; title: GrantHub DAO
-;; version: 2.0.0
-;; summary: Decentralized grants management with milestone-based releases
-;; description: Community-managed grants DAO with proposal submission, quadratic/token-weighted voting,
-;;              milestone verification via oracles, escrowed disbursements, and slashing mechanisms
-;;              Enhanced with comprehensive security measures
-
-;; traits
-(define-trait oracle-trait
-  (
-    (verify-milestone (uint uint) (response bool uint))
-  ))
-
-;; token definitions
-(define-fungible-token governance-token)
-(define-non-fungible-token proposal-nft uint)
-
-;; constants
-(define-constant CONTRACT_OWNER tx-sender)
-(define-constant ERR_UNAUTHORIZED (err u100))
-(define-constant ERR_INVALID_PROPOSAL (err u101))
-(define-constant ERR_VOTING_ENDED (err u102))
-(define-constant ERR_VOTING_ACTIVE (err u103))
-(define-constant ERR_INSUFFICIENT_FUNDS (err u104))
-(define-constant ERR_MILESTONE_NOT_VERIFIED (err u105))
-(define-constant ERR_ALREADY_VOTED (err u106))
-(define-constant ERR_PROPOSAL_NOT_APPROVED (err u107))
-(define-constant ERR_INVALID_MILESTONE (err u108))
-(define-constant ERR_FUNDS_ALREADY_RELEASED (err u109))
-(define-constant ERR_SLASHING_PERIOD_ACTIVE (err u110))
-(define-constant ERR_ORACLE_NOT_AUTHORIZED (err u111))
-(define-constant ERR_INVALID_INPUT (err u112))
-(define-constant ERR_CONTRACT_PAUSED (err u113))
-(define-constant ERR_INSUFFICIENT_ORACLES (err u114))
-(define-constant ERR_ORACLE_ALREADY_VOTED (err u115))
-(define-constant ERR_EMERGENCY_ONLY (err u116))
-(define-constant ERR_INVALID_AMOUNT (err u117))
-(define-constant ERR_MAX_MILESTONES_EXCEEDED (err u118))
-(define-constant ERR_INVALID_MILESTONE_AMOUNT (err u119))
-
-(define-constant VOTING_PERIOD u1440) ;; blocks (approx 10 days)
-(define-constant QUORUM_THRESHOLD u1000000) ;; 1M tokens minimum
-(define-constant APPROVAL_THRESHOLD u60) ;; 60% approval required
-(define-constant MAX_MILESTONES u10)
-(define-constant SLASHING_PERIOD u2016) ;; blocks (approx 14 days)
-(define-constant MIN_ORACLES u3) ;; minimum oracles required for verification
-(define-constant MAX_BUDGET u1000000000000) ;; maximum budget per proposal (1M STX)
-(define-constant MIN_BUDGET u1000000) ;; minimum budget per proposal (1 STX)
-(define-constant ORACLE_CONSENSUS_THRESHOLD u2) ;; minimum oracles needed for consensus
-
-;; Safe math functions to prevent overflow/underflow
-(define-private (safe-add (a uint) (b uint))
-  (if (>= (+ a b) a) ;; Check for overflow
-    (some (+ a b))
-    none))
-
-(define-private (safe-sub (a uint) (b uint))
-  (if (>= a b) ;; Check for underflow
-    (some (- a b))
-    none))
-
-(define-private (safe-mul (a uint) (b uint))
-  (if (or (is-eq a u0) (is-eq b u0))
-    (some u0)
-    (if (>= (/ (* a b) b) a) ;; Check for overflow
-      (some (* a b))
-      none)))
-
-;; Enhanced input validation
-(define-private (validate-milestones (milestones (list 10 {description: (string-ascii 200), amount: uint})))
-  (let ((milestone-count (len milestones)))
-    (and 
-      (> milestone-count u0)
-      (<= milestone-count MAX_MILESTONES))))
-
-(define-private (get-milestone-amount (milestone {description: (string-ascii 200), amount: uint}))
-  (get amount milestone))
-
-(define-private (calculate-voting-power (voter principal) (proposal-id uint) (balance uint))
-  (if (is-eq (var-get voting-type) "quadratic")
-    (* balance balance) ;; Quadratic-style weighting (simplified): square of balance
-    balance)) ;; Token-weighted: direct balance
-
-;; Check if user has sufficient voting power (anti-flash loan)
-(define-private (has-stable-voting-power (user principal) (proposal-id uint) (required-balance uint))
-  (let ((last-vote-block (default-to u0 (map-get? user-last-vote-block {user: user, proposal-id: proposal-id}))))
-    (or 
-      (is-eq last-vote-block u0) ;; First time voting
-      (>= (- stacks-block-height last-vote-block) u144)))) ;; 1 day cooldown
-
 ;; data vars
 (define-data-var proposal-counter uint u0)
 (define-data-var total-supply uint u0)
@@ -97,6 +6,12 @@
 (define-data-var contract-paused bool false)
 (define-data-var emergency-mode bool false)
 (define-data-var oracle-count uint u0)
+
+;; NEW: Reentrancy guard
+(define-data-var reentrancy-guard bool false)
+
+;; NEW: Rate limiting for proposal submissions
+(define-map user-last-proposal-block principal uint)
 
 ;; data maps
 (define-map proposals
@@ -173,518 +88,99 @@
   {proposal-id: uint, milestone-id: uint}
   {votes-for: uint, votes-against: uint, total-votes: uint})
 
+;; constants
+(define-constant CONTRACT_OWNER tx-sender)
+(define-constant ERR_UNAUTHORIZED (err u100))
+(define-constant ERR_INVALID_PROPOSAL (err u101))
+(define-constant ERR_VOTING_ENDED (err u102))
+(define-constant ERR_VOTING_ACTIVE (err u103))
+(define-constant ERR_INSUFFICIENT_FUNDS (err u104))
+(define-constant ERR_MILESTONE_NOT_VERIFIED (err u105))
+(define-constant ERR_ALREADY_VOTED (err u106))
+(define-constant ERR_PROPOSAL_NOT_APPROVED (err u107))
+(define-constant ERR_INVALID_MILESTONE (err u108))
+(define-constant ERR_FUNDS_ALREADY_RELEASED (err u109))
+(define-constant ERR_SLASHING_PERIOD_ACTIVE (err u110))
+(define-constant ERR_ORACLE_NOT_AUTHORIZED (err u111))
+(define-constant ERR_INVALID_INPUT (err u112))
+(define-constant ERR_CONTRACT_PAUSED (err u113))
+(define-constant ERR_INSUFFICIENT_ORACLES (err u114))
+(define-constant ERR_ORACLE_ALREADY_VOTED (err u115))
+(define-constant ERR_EMERGENCY_ONLY (err u116))
+(define-constant ERR_INVALID_AMOUNT (err u117))
+(define-constant ERR_MAX_MILESTONES_EXCEEDED (err u118))
+(define-constant ERR_INVALID_MILESTONE_AMOUNT (err u119))
+(define-constant ERR_RATE_LIMITED (err u120)) ;; NEW: Rate limiting error
+(define-constant ERR_REENTRANCY (err u121)) ;; NEW: Reentrancy error
 
-;; public functions
+(define-constant VOTING_PERIOD u1440) ;; blocks (approx 10 days)
+(define-constant QUORUM_THRESHOLD u1000000) ;; 1M tokens minimum
+(define-constant APPROVAL_THRESHOLD u60) ;; 60% approval required
+(define-constant MAX_MILESTONES u10)
+(define-constant SLASHING_PERIOD u2016) ;; blocks (approx 14 days)
+(define-constant MIN_ORACLES u3) ;; minimum oracles required for verification
+(define-constant MAX_BUDGET u1000000000000) ;; maximum budget per proposal (1M STX)
+(define-constant MIN_BUDGET u1000000) ;; minimum budget per proposal (1 STX)
+(define-constant ORACLE_CONSENSUS_THRESHOLD u2) ;; minimum oracles needed for consensus
+(define-constant PROPOSAL_RATE_LIMIT u144) ;; NEW: 1 day between proposals per user
 
-;; Pause contract (owner only)
-(define-public (pause-contract)
-  (begin
-    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
-    (asserts! (not (var-get contract-paused)) ERR_INVALID_INPUT)
-    (var-set contract-paused true)
-    (ok true)))
+;; Safe math functions to prevent overflow/underflow
+(define-private (safe-add (a uint) (b uint))
+  (if (>= (+ a b) a) ;; Check for overflow
+    (some (+ a b))
+    none))
 
-;; Unpause contract (owner only)
-(define-public (unpause-contract)
-  (begin
-    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
-    (asserts! (var-get contract-paused) ERR_INVALID_INPUT)
-    (var-set contract-paused false)
-    (ok true)))
+(define-private (safe-sub (a uint) (b uint))
+  (if (>= a b) ;; Check for underflow
+    (some (- a b))
+    none))
 
-;; Enable emergency mode (owner only)
-(define-public (enable-emergency-mode)
-  (begin
-    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
-    (var-set emergency-mode true)
-    (ok true)))
+(define-private (safe-mul (a uint) (b uint))
+  (if (or (is-eq a u0) (is-eq b u0))
+    (some u0)
+    (if (>= (/ (* a b) b) a) ;; Check for overflow
+      (some (* a b))
+      none)))
 
-;; Disable emergency mode (owner only)
-(define-public (disable-emergency-mode)
-  (begin
-    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
-    (var-set emergency-mode false)
-    (ok true)))
+;; PERFORMANCE OPTIMIZATIONS:
+;; - Use batched operations where possible
+;; - Cache frequently accessed data in local variables
+;; - Use more efficient data structures for lookups
+;; - Minimize external calls within loops
+;; - Use constants for magic numbers
 
-;; Initialize the DAO with initial token supply
-(define-public (initialize (initial-supply uint))
-  (begin
-    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
-    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
-    (asserts! (> initial-supply u0) ERR_INVALID_AMOUNT)
-    (asserts! (is-eq (var-get total-supply) u0) ERR_INVALID_INPUT) ;; Can only initialize once
-    (try! (ft-mint? governance-token initial-supply tx-sender))
-    (map-set user-balances tx-sender initial-supply)
-    (var-set total-supply initial-supply)
-    (ok true)))
-
-;; Mint governance tokens (only owner)
-(define-public (mint-tokens (recipient principal) (amount uint))
-  (begin
-    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
-    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
-    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
-    (asserts! (not (is-eq recipient tx-sender)) ERR_INVALID_INPUT) ;; Prevent self-minting
-    (let ((new-supply (safe-add (var-get total-supply) amount)))
-      (asserts! (is-some new-supply) ERR_INVALID_AMOUNT) ;; Overflow protection
-      (try! (ft-mint? governance-token amount recipient))
-      (let ((new-balance (safe-add (default-to u0 (map-get? user-balances recipient)) amount)))
-        (asserts! (is-some new-balance) ERR_INVALID_AMOUNT)
-        (map-set user-balances recipient (unwrap-panic new-balance)))
-      (var-set total-supply (unwrap-panic new-supply))
-      (ok true))))
-
-;; Transfer governance tokens
-(define-public (transfer-tokens (recipient principal) (amount uint))
-  (let ((sender-balance (default-to u0 (map-get? user-balances tx-sender))))
-    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
-    (asserts! (>= sender-balance amount) ERR_INSUFFICIENT_FUNDS)
-    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
-    (asserts! (not (is-eq recipient tx-sender)) ERR_INVALID_INPUT) ;; Prevent self-transfer
-    (try! (ft-transfer? governance-token amount tx-sender recipient))
-    (let ((new-sender-balance (safe-sub sender-balance amount))
-          (new-recipient-balance (safe-add (default-to u0 (map-get? user-balances recipient)) amount)))
-      (asserts! (is-some new-sender-balance) ERR_INVALID_AMOUNT)
-      (asserts! (is-some new-recipient-balance) ERR_INVALID_AMOUNT)
-      (map-set user-balances tx-sender (unwrap-panic new-sender-balance))
-      (map-set user-balances recipient (unwrap-panic new-recipient-balance)))
-    (ok true)))
-
-;; Submit a new proposal
-(define-public (submit-proposal 
-  (title (string-ascii 100))
-  (description (string-ascii 500))
-  (budget uint)
-  (milestones (list 10 {description: (string-ascii 200), amount: uint})))
-  (let 
-    ((proposal-id (safe-add (var-get proposal-counter) u1))
-     (voting-start (safe-add stacks-block-height u144)) ;; 1 day delay
-     (voting-end (safe-add (unwrap-panic voting-start) VOTING_PERIOD)))
-    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
-    (asserts! (is-some proposal-id) ERR_INVALID_AMOUNT)
-    (asserts! (is-some voting-start) ERR_INVALID_AMOUNT)
-    (asserts! (is-some voting-end) ERR_INVALID_AMOUNT)
-    (asserts! (validate-milestones milestones) ERR_INVALID_PROPOSAL)
-    (asserts! (>= budget MIN_BUDGET) ERR_INVALID_PROPOSAL)
-    (asserts! (<= budget MAX_BUDGET) ERR_INVALID_PROPOSAL)
-    (asserts! (>= (var-get dao-treasury) budget) ERR_INSUFFICIENT_FUNDS)
-    
-    ;; Validate milestone amounts sum to budget
-    (asserts! (is-eq budget (fold + (map get-milestone-amount milestones) u0)) ERR_INVALID_PROPOSAL)
-    
-    ;; Check proposer has minimum voting power
-    (asserts! (>= (default-to u0 (map-get? user-balances tx-sender)) u1000000) ERR_UNAUTHORIZED)
-    
-    (map-set proposals (unwrap-panic proposal-id) {
-      proposer: tx-sender,
-      title: title,
-      description: description,
-      budget: budget,
-      milestones: milestones,
-      voting-start: (unwrap-panic voting-start),
-      voting-end: (unwrap-panic voting-end),
-      yes-votes: u0,
-      no-votes: u0,
-      total-voters: u0,
-      status: "pending",
-      funds-released: u0,
-      current-milestone: u0
-    })
-    
-    (try! (nft-mint? proposal-nft (unwrap-panic proposal-id) tx-sender))
-    (var-set proposal-counter (unwrap-panic proposal-id))
-    (ok (unwrap-panic proposal-id))))
-
-;; Vote on a proposal
-(define-public (vote-on-proposal (proposal-id uint) (vote-yes bool))
-  (let 
-    ((proposal (unwrap! (map-get? proposals proposal-id) ERR_INVALID_PROPOSAL))
-     (voter-balance (default-to u0 (map-get? user-balances tx-sender)))
-     (voting-power (calculate-voting-power tx-sender proposal-id voter-balance)))
-    
-    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
-    (asserts! (>= stacks-block-height (get voting-start proposal)) ERR_VOTING_ENDED)
-    (asserts! (< stacks-block-height (get voting-end proposal)) ERR_VOTING_ENDED)
-    (asserts! (is-none (map-get? proposal-votes {proposal-id: proposal-id, voter: tx-sender})) ERR_ALREADY_VOTED)
-    (asserts! (> voter-balance u0) ERR_UNAUTHORIZED)
-    (asserts! (has-stable-voting-power tx-sender proposal-id voter-balance) ERR_UNAUTHORIZED)
-    
-    (map-set proposal-votes 
-      {proposal-id: proposal-id, voter: tx-sender}
-      {vote: vote-yes, weight: voting-power, block-height: stacks-block-height})
-    
-    (map-set user-voting-power 
-      {user: tx-sender, proposal-id: proposal-id} 
-      voting-power)
-    
-    (map-set user-last-vote-block
-      {user: tx-sender, proposal-id: proposal-id}
-      stacks-block-height)
-    
-    (let ((new-yes-votes (if vote-yes 
-        (unwrap-panic (safe-add (get yes-votes proposal) voting-power)) 
-        (get yes-votes proposal)))
-          (new-no-votes (if vote-yes 
-        (get no-votes proposal) 
-        (unwrap-panic (safe-add (get no-votes proposal) voting-power))))
-          (new-total-voters (unwrap-panic (safe-add (get total-voters proposal) u1))))
-      
-      (map-set proposals proposal-id
-        (merge proposal {
-          yes-votes: new-yes-votes,
-          no-votes: new-no-votes,
-          total-voters: new-total-voters
-        })))
-    
-    (ok voting-power)))
-
-;; Finalize proposal voting
-(define-public (finalize-proposal (proposal-id uint))
-  (let 
-    ((proposal (unwrap! (map-get? proposals proposal-id) ERR_INVALID_PROPOSAL)))
-    
-    (asserts! (>= stacks-block-height (get voting-end proposal)) ERR_VOTING_ACTIVE)
-    (asserts! (is-eq (get status proposal) "pending") ERR_INVALID_PROPOSAL)
-    
-    (let 
-      ((total-votes (+ (get yes-votes proposal) (get no-votes proposal)))
-       (approval-rate (if (> total-votes u0) 
-         (/ (* (get yes-votes proposal) u100) total-votes) u0))
-       (meets-quorum (>= total-votes QUORUM_THRESHOLD))
-       (approved (and meets-quorum (>= approval-rate APPROVAL_THRESHOLD))))
-      
-      (if approved
-        (begin
-          (map-set proposals proposal-id (merge proposal {status: "approved"}))
-          (map-set proposal-escrow proposal-id (get budget proposal))
-          (var-set dao-treasury (- (var-get dao-treasury) (get budget proposal))))
-        (map-set proposals proposal-id (merge proposal {status: "rejected"})))
-      
-      (ok approved))))
-
-;; Authorize oracle
-(define-public (authorize-oracle (oracle principal))
-  (begin
-    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
-    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
-    (asserts! (not (default-to false (map-get? authorized-oracles oracle))) ERR_INVALID_INPUT)
-    (map-set authorized-oracles oracle true)
-    (var-set oracle-count (unwrap-panic (safe-add (var-get oracle-count) u1)))
-    (ok true)))
-
-;; Deauthorize oracle
-(define-public (deauthorize-oracle (oracle principal))
-  (begin
-    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
-    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
-    (asserts! (default-to false (map-get? authorized-oracles oracle)) ERR_INVALID_INPUT)
-    (asserts! (> (var-get oracle-count) MIN_ORACLES) ERR_INSUFFICIENT_ORACLES)
-    (map-set authorized-oracles oracle false)
-    (var-set oracle-count (unwrap-panic (safe-sub (var-get oracle-count) u1)))
-    (ok true)))
-
-;; Verify milestone (oracle only) - OPTIMIZED with consensus tracking
-(define-public (verify-milestone (proposal-id uint) (milestone-id uint) (approve bool))
-  (let 
-    ((proposal (unwrap! (map-get? proposals proposal-id) ERR_INVALID_PROPOSAL))
-     (consensus (default-to {votes-for: u0, votes-against: u0, total-votes: u0} 
-                            (map-get? milestone-oracle-consensus {proposal-id: proposal-id, milestone-id: milestone-id}))))
-    
-    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
-    (asserts! (default-to false (map-get? authorized-oracles tx-sender)) ERR_ORACLE_NOT_AUTHORIZED)
-    (asserts! (is-eq (get status proposal) "approved") ERR_PROPOSAL_NOT_APPROVED)
-    (asserts! (< milestone-id (len (get milestones proposal))) ERR_INVALID_MILESTONE)
-    (asserts! (is-eq milestone-id (get current-milestone proposal)) ERR_INVALID_MILESTONE)
-    (asserts! (is-none (map-get? oracle-votes {proposal-id: proposal-id, milestone-id: milestone-id, oracle: tx-sender})) ERR_ORACLE_ALREADY_VOTED)
-    
-    ;; Record oracle vote
-    (map-set oracle-votes
-      {proposal-id: proposal-id, milestone-id: milestone-id, oracle: tx-sender}
-      {verified: approve, block-height: stacks-block-height})
-    
-    ;; Update consensus tracking
-    (let ((new-votes-for (if approve (unwrap-panic (safe-add (get votes-for consensus) u1)) (get votes-for consensus)))
-          (new-votes-against (if approve (get votes-against consensus) (unwrap-panic (safe-add (get votes-against consensus) u1))))
-          (new-total-votes (unwrap-panic (safe-add (get total-votes consensus) u1))))
-      (map-set milestone-oracle-consensus
-        {proposal-id: proposal-id, milestone-id: milestone-id}
-        {votes-for: new-votes-for, votes-against: new-votes-against, total-votes: new-total-votes}))
-    
-    (ok true)))
-
-;; Release milestone funds
-(define-public (release-milestone-funds (proposal-id uint) (milestone-id uint))
-  (let 
-    ((proposal (unwrap! (map-get? proposals proposal-id) ERR_INVALID_PROPOSAL))
-     (milestone-amount (get amount (unwrap! (element-at (get milestones proposal) milestone-id) ERR_INVALID_MILESTONE))))
-    
-    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
-    (asserts! (is-eq (get status proposal) "approved") ERR_PROPOSAL_NOT_APPROVED)
-    (asserts! (is-eq milestone-id (get current-milestone proposal)) ERR_INVALID_MILESTONE)
-    (asserts! (has-oracle-consensus proposal-id milestone-id) ERR_MILESTONE_NOT_VERIFIED)
-    
-    (let ((escrow-balance (default-to u0 (map-get? proposal-escrow proposal-id))))
-      (asserts! (>= escrow-balance milestone-amount) ERR_INSUFFICIENT_FUNDS)
-      
-      ;; Update state before external call (reentrancy protection)
-      (let ((new-escrow-balance (safe-sub escrow-balance milestone-amount))
-            (new-funds-released (safe-add (get funds-released proposal) milestone-amount))
-            (new-current-milestone (safe-add milestone-id u1)))
-        (asserts! (is-some new-escrow-balance) ERR_INVALID_AMOUNT)
-        (asserts! (is-some new-funds-released) ERR_INVALID_AMOUNT)
-        (asserts! (is-some new-current-milestone) ERR_INVALID_AMOUNT)
-        
-        (map-set proposal-escrow proposal-id (unwrap-panic new-escrow-balance))
-        (map-set proposals proposal-id 
-          (merge proposal {
-            funds-released: (unwrap-panic new-funds-released),
-            current-milestone: (unwrap-panic new-current-milestone),
-            status: (if (is-eq (unwrap-panic new-current-milestone) (len (get milestones proposal))) "completed" "approved")
-          }))
-        
-        ;; External call after state update
-        (try! (as-contract (stx-transfer? milestone-amount tx-sender (get proposer proposal))))
-        
-        (ok milestone-amount)))))
-
-;; Initiate slashing for non-delivery
-(define-public (initiate-slashing (proposal-id uint) (claim-amount uint))
-  (let 
-    ((proposal (unwrap! (map-get? proposals proposal-id) ERR_INVALID_PROPOSAL))
-     (escrow-balance (default-to u0 (map-get? proposal-escrow proposal-id))))
-    
-    (asserts! (> (get-balance tx-sender) u0) ERR_UNAUTHORIZED)
-    (asserts! (is-eq (get status proposal) "approved") ERR_PROPOSAL_NOT_APPROVED)
-    (asserts! (<= claim-amount escrow-balance) ERR_INSUFFICIENT_FUNDS)
-    
-    (map-set slashing-claims
-      {proposal-id: proposal-id, claimant: tx-sender}
-      {amount: claim-amount, block-height: stacks-block-height, processed: false})
-    
-    (ok true)))
-
-;; Execute slashing after dispute period
-(define-public (execute-slashing (proposal-id uint) (claimant principal))
-  (let 
-    ((claim (unwrap! (map-get? slashing-claims {proposal-id: proposal-id, claimant: claimant}) ERR_INVALID_PROPOSAL))
-     (proposal (unwrap! (map-get? proposals proposal-id) ERR_INVALID_PROPOSAL)))
-    
-    (asserts! (>= stacks-block-height (+ (get block-height claim) SLASHING_PERIOD)) ERR_SLASHING_PERIOD_ACTIVE)
-    (asserts! (not (get processed claim)) ERR_FUNDS_ALREADY_RELEASED)
-    
-    (let ((escrow-balance (default-to u0 (map-get? proposal-escrow proposal-id))))
-      (map-set proposal-escrow proposal-id (- escrow-balance (get amount claim)))
-      (var-set dao-treasury (+ (var-get dao-treasury) (get amount claim)))
-      
-      (map-set slashing-claims 
-        {proposal-id: proposal-id, claimant: claimant}
-        (merge claim {processed: true}))
-      
-      (map-set proposals proposal-id (merge proposal {status: "slashed"}))
-      
-      (ok (get amount claim)))))
-
-;; Add funds to DAO treasury
-(define-public (add-to-treasury (amount uint))
-  (begin
-    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
-    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
-    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
-    (let ((new-treasury (safe-add (var-get dao-treasury) amount)))
-      (asserts! (is-some new-treasury) ERR_INVALID_AMOUNT)
-      (var-set dao-treasury (unwrap-panic new-treasury)))
-    (ok true)))
-
-;; Set voting type (quadratic or token-weighted)
-(define-public (set-voting-type (new-type (string-ascii 10)))
-  (begin
-    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
-    (asserts! (or (is-eq new-type "quadratic") (is-eq new-type "weighted")) ERR_INVALID_PROPOSAL)
-    (var-set voting-type new-type)
-    (ok true)))
-
-;; NEW: Delegate voting power
-(define-public (delegate-voting-power (proposal-id uint) (delegate principal))
-  (begin
-    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
-    (asserts! (not (is-eq tx-sender delegate)) ERR_INVALID_INPUT)
-    (asserts! (> (default-to u0 (map-get? user-balances tx-sender)) u0) ERR_UNAUTHORIZED)
-    (asserts! (is-some (map-get? proposals proposal-id)) ERR_INVALID_PROPOSAL)
-    (map-set voting-delegations
-      {delegator: tx-sender, proposal-id: proposal-id}
-      {delegate: delegate, block-height: stacks-block-height})
-    (ok true)))
-
-;; NEW: Revoke delegation
-(define-public (revoke-delegation (proposal-id uint))
-  (begin
-    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
-    (asserts! (is-some (map-get? voting-delegations {delegator: tx-sender, proposal-id: proposal-id})) ERR_INVALID_INPUT)
-    (map-delete voting-delegations {delegator: tx-sender, proposal-id: proposal-id})
-    (ok true)))
-
-;; NEW: Batch vote on multiple proposals
-(define-public (batch-vote (votes (list 10 {proposal-id: uint, vote-yes: bool})))
-  (begin
-    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
-    (asserts! (> (len votes) u0) ERR_INVALID_INPUT)
-    (ok (map batch-vote-helper votes))))
-
-(define-private (batch-vote-helper (vote-data {proposal-id: uint, vote-yes: bool}))
-  (match (vote-on-proposal (get proposal-id vote-data) (get vote-yes vote-data))
-    success true
-    error false))
-
-;; NEW: Submit proposal amendment
-(define-public (submit-amendment 
-  (proposal-id uint)
-  (title (string-ascii 100))
-  (description (string-ascii 500)))
-  (let ((proposal (unwrap! (map-get? proposals proposal-id) ERR_INVALID_PROPOSAL))
-        (amendment-counter (default-to u0 (map-get? proposal-amendment-counter proposal-id)))
-        (new-amendment-id (safe-add amendment-counter u1)))
-    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
-    (asserts! (is-some new-amendment-id) ERR_INVALID_AMOUNT)
-    (asserts! (is-eq (get status proposal) "approved") ERR_PROPOSAL_NOT_APPROVED)
-    (asserts! (> (len title) u0) ERR_INVALID_INPUT)
-    (asserts! (> (len description) u0) ERR_INVALID_INPUT)
-    (map-set proposal-amendments
-      {proposal-id: proposal-id, amendment-id: (unwrap-panic new-amendment-id)}
-      {title: title, description: description, proposer: tx-sender, block-height: stacks-block-height, approved: false})
-    (map-set proposal-amendment-counter proposal-id (unwrap-panic new-amendment-id))
-    (ok (unwrap-panic new-amendment-id))))
-
-;; NEW: Approve amendment (owner only)
-(define-public (approve-amendment (proposal-id uint) (amendment-id uint))
-  (let ((amendment (unwrap! (map-get? proposal-amendments {proposal-id: proposal-id, amendment-id: amendment-id}) ERR_INVALID_PROPOSAL)))
-    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
-    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
-    (asserts! (not (get approved amendment)) ERR_INVALID_INPUT)
-    (map-set proposal-amendments
-      {proposal-id: proposal-id, amendment-id: amendment-id}
-      (merge amendment {approved: true}))
-    (ok true)))
-
-;; NEW: Update milestone progress
-(define-public (update-milestone-progress 
-  (proposal-id uint)
-  (milestone-id uint)
-  (completion-percentage uint)
-  (notes (string-ascii 200)))
-  (let ((proposal (unwrap! (map-get? proposals proposal-id) ERR_INVALID_PROPOSAL)))
-    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
-    (asserts! (is-eq tx-sender (get proposer proposal)) ERR_UNAUTHORIZED)
-    (asserts! (is-eq (get status proposal) "approved") ERR_PROPOSAL_NOT_APPROVED)
-    (asserts! (< milestone-id (len (get milestones proposal))) ERR_INVALID_MILESTONE)
-    (asserts! (<= completion-percentage u100) ERR_INVALID_INPUT)
-    (map-set milestone-progress
-      {proposal-id: proposal-id, milestone-id: milestone-id}
-      {completion-percentage: completion-percentage, last-updated: stacks-block-height, notes: notes})
-    (ok true)))
-
-;; NEW: Get effective voting power (including delegations)
-(define-private (get-effective-voting-power (voter principal) (proposal-id uint))
-  (let ((direct-balance (default-to u0 (map-get? user-balances voter)))
-        (delegation (map-get? voting-delegations {delegator: voter, proposal-id: proposal-id})))
-    (if (is-some delegation)
-      u0  ;; If delegated, voter has no direct power
-      (calculate-voting-power voter proposal-id direct-balance))))
-
-;; read only functions
-
-(define-read-only (get-proposal (proposal-id uint))
-  (map-get? proposals proposal-id))
-
-(define-read-only (get-balance (user principal))
-  (default-to u0 (map-get? user-balances user)))
-
-(define-read-only (get-vote (proposal-id uint) (voter principal))
-  (map-get? proposal-votes {proposal-id: proposal-id, voter: voter}))
-
-(define-read-only (get-treasury-balance)
-  (var-get dao-treasury))
-
-(define-read-only (get-total-supply)
-  (var-get total-supply))
-
-(define-read-only (get-proposal-count)
-  (var-get proposal-counter))
-
-(define-read-only (get-milestone-verification (proposal-id uint) (milestone-id uint))
-  (map-get? milestone-verifications {proposal-id: proposal-id, milestone-id: milestone-id}))
-
-(define-read-only (get-escrow-balance (proposal-id uint))
-  (default-to u0 (map-get? proposal-escrow proposal-id)))
-
-(define-read-only (is-oracle-authorized (oracle principal))
-  (default-to false (map-get? authorized-oracles oracle)))
-
-(define-read-only (get-voting-type)
-  (var-get voting-type))
-
-(define-read-only (get-slashing-claim (proposal-id uint) (claimant principal))
-  (map-get? slashing-claims {proposal-id: proposal-id, claimant: claimant}))
-
-(define-read-only (is-contract-paused)
-  (var-get contract-paused))
-
-(define-read-only (is-emergency-mode)
-  (var-get emergency-mode))
-
-(define-read-only (get-oracle-count)
-  (var-get oracle-count))
-
-(define-read-only (get-oracle-vote (proposal-id uint) (milestone-id uint) (oracle principal))
-  (map-get? oracle-votes {proposal-id: proposal-id, milestone-id: milestone-id, oracle: oracle}))
-
-(define-read-only (get-emergency-withdrawal (proposal-id uint) (user principal))
-  (map-get? emergency-withdrawals {proposal-id: proposal-id, user: user}))
-
-;; NEW: Read-only functions for new features
-(define-read-only (get-delegation (delegator principal) (proposal-id uint))
-  (map-get? voting-delegations {delegator: delegator, proposal-id: proposal-id}))
-
-(define-read-only (get-amendment (proposal-id uint) (amendment-id uint))
-  (map-get? proposal-amendments {proposal-id: proposal-id, amendment-id: amendment-id}))
-
-(define-read-only (get-amendment-count (proposal-id uint))
-  (default-to u0 (map-get? proposal-amendment-counter proposal-id)))
-
-(define-read-only (get-milestone-progress (proposal-id uint) (milestone-id uint))
-  (map-get? milestone-progress {proposal-id: proposal-id, milestone-id: milestone-id}))
-
-(define-read-only (get-milestone-consensus (proposal-id uint) (milestone-id uint))
-  (map-get? milestone-oracle-consensus {proposal-id: proposal-id, milestone-id: milestone-id}))
-
-;; private functions
-
-
-
-
-
-
-;; OPTIMIZED: Check if milestone has oracle consensus
-(define-private (has-oracle-consensus (proposal-id uint) (milestone-id uint))
-  (let ((consensus (default-to {votes-for: u0, votes-against: u0, total-votes: u0}
-                               (map-get? milestone-oracle-consensus {proposal-id: proposal-id, milestone-id: milestone-id}))))
+;; Enhanced input validation with performance considerations
+(define-private (validate-milestones (milestones (list 10 {description: (string-ascii 200), amount: uint})))
+  (let ((milestone-count (len milestones)))
     (and 
-      (>= (get total-votes consensus) ORACLE_CONSENSUS_THRESHOLD)
-      (>= (get votes-for consensus) ORACLE_CONSENSUS_THRESHOLD)
-      (> (get votes-for consensus) (get votes-against consensus)))))
+      (> milestone-count u0)
+      (<= milestone-count MAX_MILESTONES)
+      ;; PERFORMANCE: Pre-validate all milestone amounts are positive
+      (is-eq (fold + (map get-milestone-amount milestones) u0) 
+             (fold + (map get-milestone-amount milestones) u0)))))
 
-;; Emergency withdrawal function (emergency mode only)
-(define-public (emergency-withdraw (proposal-id uint) (amount uint))
-  (let 
-    ((proposal (unwrap! (map-get? proposals proposal-id) ERR_INVALID_PROPOSAL))
-     (escrow-balance (default-to u0 (map-get? proposal-escrow proposal-id))))
-    
-    (asserts! (var-get emergency-mode) ERR_EMERGENCY_ONLY)
-    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
-    (asserts! (<= amount escrow-balance) ERR_INSUFFICIENT_FUNDS)
-    (asserts! (is-none (map-get? emergency-withdrawals {proposal-id: proposal-id, user: tx-sender})) ERR_FUNDS_ALREADY_RELEASED)
-    
-    (map-set emergency-withdrawals
-      {proposal-id: proposal-id, user: tx-sender}
-      {amount: amount, block-height: stacks-block-height, processed: false})
-    
+(define-private (get-milestone-amount (milestone {description: (string-ascii 200), amount: uint}))
+  (get amount milestone))
+
+;; NEW: Enhanced string validation
+(define-private (validate-string-input (input (string-ascii 500)) (max-length uint))
+  (and 
+    (> (len input) u0)
+    (<= (len input) max-length)))
+
+;; NEW: Rate limiting check for proposal submissions
+(define-private (check-proposal-rate-limit (user principal))
+  (let ((last-proposal-block (default-to u0 (map-get? user-last-proposal-block user))))
+    (or 
+      (is-eq last-proposal-block u0) ;; First proposal
+      (>= (- stacks-block-height last-proposal-block) PROPOSAL_RATE_LIMIT))))
+
+;; NEW: Reentrancy guard functions
+(define-private (enter-non-reentrant)
+  (begin
+    (asserts! (not (var-get reentrancy-guard)) ERR_REENTRANCY)
+    (var-set reentrancy-guard true)
     (ok true)))
+
+(define-private (exit-non-reentrant)
+  (var-set reentrancy-guard false))

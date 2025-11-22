@@ -1,9 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, beforeEach } from "vitest";
 import { Cl } from "@stacks/transactions";
 
 const accounts = simnet.getAccounts();
 const deployer = accounts.get("deployer")!;
 const address1 = accounts.get("wallet_1")!;
+const address2 = accounts.get("wallet_2")!;
+const address3 = accounts.get("wallet_3")!;
 
 const CONTRACT_NAME = "granthubcontract";
 
@@ -137,6 +139,237 @@ describe("GrantHub DAO Security Tests", () => {
       
       const ownerEmergency = simnet.callPublicFn(CONTRACT_NAME, "enable-emergency-mode", [], deployer);
       expect(ownerEmergency.result).toBeOk(Cl.bool(true));
+    });
+  });
+
+  describe("Proposal Submission Tests", () => {
+    it("should initialize DAO with governance tokens", () => {
+      const { result } = simnet.callPublicFn(CONTRACT_NAME, "initialize", [Cl.uint(10000000)], deployer);
+      expect(result).toBeOk(Cl.bool(true));
+      
+      const balance = simnet.callReadOnlyFn(CONTRACT_NAME, "get-balance", [Cl.principal(deployer)], deployer);
+      expect(balance.result).toBeUint(10000000);
+    });
+
+    it("should submit a valid proposal", () => {
+      // Initialize DAO first
+      simnet.callPublicFn(CONTRACT_NAME, "initialize", [Cl.uint(10000000)], deployer);
+      
+      const milestones = [
+        Cl.tuple({ description: Cl.stringAscii("Milestone 1"), amount: Cl.uint(500000) }),
+        Cl.tuple({ description: Cl.stringAscii("Milestone 2"), amount: Cl.uint(500000) })
+      ];
+      
+      const { result } = simnet.callPublicFn(CONTRACT_NAME, "submit-proposal", [
+        Cl.stringAscii("Test Proposal"),
+        Cl.stringAscii("A test proposal for GrantHub"),
+        Cl.uint(1000000),
+        Cl.list(milestones)
+      ], deployer);
+      
+      expect(result).toBeOk(Cl.uint(1)); // First proposal ID
+    });
+
+    it("should reject proposal with insufficient proposer balance", () => {
+      const milestones = [
+        Cl.tuple({ description: Cl.stringAscii("Milestone 1"), amount: Cl.uint(500000) })
+      ];
+      
+      const { result } = simnet.callPublicFn(CONTRACT_NAME, "submit-proposal", [
+        Cl.stringAscii("Test Proposal"),
+        Cl.stringAscii("A test proposal"),
+        Cl.uint(1000000),
+        Cl.list(milestones)
+      ], address1); // address1 has no tokens
+      
+      expect(result).toBeErr(Cl.uint(100)); // ERR_UNAUTHORIZED
+    });
+
+    it("should reject proposal with budget exceeding treasury", () => {
+      simnet.callPublicFn(CONTRACT_NAME, "initialize", [Cl.uint(10000000)], deployer);
+      
+      const milestones = [
+        Cl.tuple({ description: Cl.stringAscii("Milestone 1"), amount: Cl.uint(5000000) })
+      ];
+      
+      const { result } = simnet.callPublicFn(CONTRACT_NAME, "submit-proposal", [
+        Cl.stringAscii("Expensive Proposal"),
+        Cl.stringAscii("Too expensive"),
+        Cl.uint(10000000), // More than treasury
+        Cl.list(milestones)
+      ], deployer);
+      
+      expect(result).toBeErr(Cl.uint(104)); // ERR_INSUFFICIENT_FUNDS
+    });
+  });
+
+  describe("Voting System Tests", () => {
+    beforeEach(() => {
+      // Setup: Initialize DAO and submit proposal
+      simnet.callPublicFn(CONTRACT_NAME, "initialize", [Cl.uint(10000000)], deployer);
+      
+      const milestones = [
+        Cl.tuple({ description: Cl.stringAscii("Milestone 1"), amount: Cl.uint(500000) }),
+        Cl.tuple({ description: Cl.stringAscii("Milestone 2"), amount: Cl.uint(500000) })
+      ];
+      
+      simnet.callPublicFn(CONTRACT_NAME, "submit-proposal", [
+        Cl.stringAscii("Voting Test Proposal"),
+        Cl.stringAscii("Test voting functionality"),
+        Cl.uint(1000000),
+        Cl.list(milestones)
+      ], deployer);
+    });
+
+    it("should allow voting on active proposal", () => {
+      // Mint tokens for address1
+      simnet.callPublicFn(CONTRACT_NAME, "mint-tokens", [Cl.principal(address1), Cl.uint(2000000)], deployer);
+      
+      const { result } = simnet.callPublicFn(CONTRACT_NAME, "vote-on-proposal", [
+        Cl.uint(1), // proposal ID
+        Cl.bool(true) // vote yes
+      ], address1);
+      
+      expect(result).toBeOk(Cl.uint(4000000)); // Quadratic voting power: 2000000^2 = 4e12, but simplified in contract
+    });
+
+    it("should prevent double voting", () => {
+      simnet.callPublicFn(CONTRACT_NAME, "mint-tokens", [Cl.principal(address1), Cl.uint(2000000)], deployer);
+      simnet.callPublicFn(CONTRACT_NAME, "vote-on-proposal", [Cl.uint(1), Cl.bool(true)], address1);
+      
+      const { result } = simnet.callPublicFn(CONTRACT_NAME, "vote-on-proposal", [
+        Cl.uint(1),
+        Cl.bool(false)
+      ], address1);
+      
+      expect(result).toBeErr(Cl.uint(106)); // ERR_ALREADY_VOTED
+    });
+
+    it("should finalize proposal after voting period", () => {
+      // Mint tokens and vote
+      simnet.callPublicFn(CONTRACT_NAME, "mint-tokens", [Cl.principal(address1), Cl.uint(2000000)], deployer);
+      simnet.callPublicFn(CONTRACT_NAME, "vote-on-proposal", [Cl.uint(1), Cl.bool(true)], address1);
+      
+      // Fast forward past voting period (mock this by directly calling finalize)
+      const { result } = simnet.callPublicFn(CONTRACT_NAME, "finalize-proposal", [Cl.uint(1)], deployer);
+      expect(result).toBeOk(Cl.bool(true)); // Should approve with sufficient votes
+    });
+  });
+
+  describe("Oracle and Milestone Tests", () => {
+    beforeEach(() => {
+      // Setup: Initialize, submit, vote, and approve proposal
+      simnet.callPublicFn(CONTRACT_NAME, "initialize", [Cl.uint(10000000)], deployer);
+      
+      const milestones = [
+        Cl.tuple({ description: Cl.stringAscii("Milestone 1"), amount: Cl.uint(500000) })
+      ];
+      
+      simnet.callPublicFn(CONTRACT_NAME, "submit-proposal", [
+        Cl.stringAscii("Oracle Test Proposal"),
+        Cl.stringAscii("Test oracle functionality"),
+        Cl.uint(500000),
+        Cl.list(milestones)
+      ], deployer);
+      
+      simnet.callPublicFn(CONTRACT_NAME, "mint-tokens", [Cl.principal(address1), Cl.uint(2000000)], deployer);
+      simnet.callPublicFn(CONTRACT_NAME, "vote-on-proposal", [Cl.uint(1), Cl.bool(true)], address1);
+      simnet.callPublicFn(CONTRACT_NAME, "finalize-proposal", [Cl.uint(1)], deployer);
+      
+      // Authorize oracles
+      simnet.callPublicFn(CONTRACT_NAME, "authorize-oracle", [Cl.principal(address1)], deployer);
+      simnet.callPublicFn(CONTRACT_NAME, "authorize-oracle", [Cl.principal(address2)], deployer);
+      simnet.callPublicFn(CONTRACT_NAME, "authorize-oracle", [Cl.principal(address3)], deployer);
+    });
+
+    it("should verify milestone with oracle consensus", () => {
+      // Oracle votes
+      simnet.callPublicFn(CONTRACT_NAME, "verify-milestone", [Cl.uint(1), Cl.uint(0), Cl.bool(true)], address1);
+      simnet.callPublicFn(CONTRACT_NAME, "verify-milestone", [Cl.uint(1), Cl.uint(0), Cl.bool(true)], address2);
+      
+      // Check consensus
+      const consensus = simnet.callReadOnlyFn(CONTRACT_NAME, "get-milestone-consensus", [Cl.uint(1), Cl.uint(0)], deployer);
+      expect(consensus.result).toStrictEqual(Cl.tuple({
+        "votes-for": Cl.uint(2),
+        "votes-against": Cl.uint(0),
+        "total-votes": Cl.uint(2)
+      }));
+    });
+
+    it("should release funds after milestone verification", () => {
+      // Get oracle consensus
+      simnet.callPublicFn(CONTRACT_NAME, "verify-milestone", [Cl.uint(1), Cl.uint(0), Cl.bool(true)], address1);
+      simnet.callPublicFn(CONTRACT_NAME, "verify-milestone", [Cl.uint(1), Cl.uint(0), Cl.bool(true)], address2);
+      
+      // Release funds
+      const { result } = simnet.callPublicFn(CONTRACT_NAME, "release-milestone-funds", [Cl.uint(1), Cl.uint(0)], deployer);
+      expect(result).toBeOk(Cl.uint(500000));
+    });
+  });
+
+  describe("Security Edge Cases", () => {
+    it("should handle overflow in token minting", () => {
+      simnet.callPublicFn(CONTRACT_NAME, "initialize", [Cl.uint(10000000)], deployer);
+      
+      // Try to mint maximum possible amount
+      const { result } = simnet.callPublicFn(CONTRACT_NAME, "mint-tokens", [
+        Cl.principal(address1), 
+        Cl.uint(18446744073709551615) // Max uint64
+      ], deployer);
+      
+      // Should either succeed or fail gracefully without overflow
+      expect(result).toBeOk(Cl.bool(true));
+    });
+
+    it("should validate milestone amounts match budget", () => {
+      simnet.callPublicFn(CONTRACT_NAME, "initialize", [Cl.uint(10000000)], deployer);
+      
+      const milestones = [
+        Cl.tuple({ description: Cl.stringAscii("Milestone 1"), amount: Cl.uint(300000) }),
+        Cl.tuple({ description: Cl.stringAscii("Milestone 2"), amount: Cl.uint(300000) })
+      ];
+      
+      // Budget doesn't match milestone sum
+      const { result } = simnet.callPublicFn(CONTRACT_NAME, "submit-proposal", [
+        Cl.stringAscii("Invalid Budget Proposal"),
+        Cl.stringAscii("Budget doesn't match milestones"),
+        Cl.uint(500000), // Sum should be 600000
+        Cl.list(milestones)
+      ], deployer);
+      
+      expect(result).toBeErr(Cl.uint(101)); // ERR_INVALID_PROPOSAL
+    });
+
+    it("should prevent oracle from voting twice on same milestone", () => {
+      simnet.callPublicFn(CONTRACT_NAME, "initialize", [Cl.uint(10000000)], deployer);
+      
+      const milestones = [
+        Cl.tuple({ description: Cl.stringAscii("Milestone 1"), amount: Cl.uint(500000) })
+      ];
+      
+      simnet.callPublicFn(CONTRACT_NAME, "submit-proposal", [
+        Cl.stringAscii("Oracle Double Vote Test"),
+        Cl.stringAscii("Test double voting prevention"),
+        Cl.uint(500000),
+        Cl.list(milestones)
+      ], deployer);
+      
+      simnet.callPublicFn(CONTRACT_NAME, "mint-tokens", [Cl.principal(address1), Cl.uint(2000000)], deployer);
+      simnet.callPublicFn(CONTRACT_NAME, "vote-on-proposal", [Cl.uint(1), Cl.bool(true)], address1);
+      simnet.callPublicFn(CONTRACT_NAME, "finalize-proposal", [Cl.uint(1)], deployer);
+      simnet.callPublicFn(CONTRACT_NAME, "authorize-oracle", [Cl.principal(address1)], deployer);
+      
+      // First vote
+      simnet.callPublicFn(CONTRACT_NAME, "verify-milestone", [Cl.uint(1), Cl.uint(0), Cl.bool(true)], address1);
+      
+      // Second vote should fail
+      const { result } = simnet.callPublicFn(CONTRACT_NAME, "verify-milestone", [
+        Cl.uint(1), 
+        Cl.uint(0), 
+        Cl.bool(false)
+      ], address1);
+      
+      expect(result).toBeErr(Cl.uint(115)); // ERR_ORACLE_ALREADY_VOTED
     });
   });
 });
